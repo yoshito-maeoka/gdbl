@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# gbdl - an interactive translator on top of `ollama run gemma3:12b`.
+#
+# Usage: gbdl [j|e|g]
+#   j  translate into Japanese (default)
+#   e  translate into English
+#   g  translate into German
+#
+# Type text, press Enter, get the translation. Quit with Ctrl-D or Ctrl-C.
+
+set -uo pipefail
+
+readonly DEFAULT_MODEL="gemma3:12b"
+readonly MODEL="${GBDL_MODEL:-$DEFAULT_MODEL}"
+readonly DEFAULT_LANGUAGE="Japanese"
+readonly SERVER_START_TIMEOUT_SECONDS=30
+readonly SERVER_POLL_INTERVAL_SECONDS=0.3
+readonly EXIT_USAGE=2
+readonly EXIT_UNAVAILABLE=69
+readonly EXIT_INTERRUPTED=130
+
+usage() {
+  cat <<'USAGE'
+Usage: gbdl [j|e|g]
+
+Interactive translator backed by a local Ollama model.
+
+Options:
+  j, -j, --japanese   translate into Japanese (default)
+  e, -e, --english    translate into English
+  g, -g, --german     translate into German
+  -h, --help          show this help
+
+Environment:
+  GBDL_MODEL          Ollama model to use (default: gemma3:12b)
+
+Quit with Ctrl-D or Ctrl-C.
+USAGE
+}
+
+log_error() {
+  printf 'gbdl: %s\n' "$*" >&2
+}
+
+log_info() {
+  printf 'gbdl: %s\n' "$*" >&2
+}
+
+# Maps a CLI language flag to the language name used in the prompt.
+resolve_language() {
+  case "$1" in
+    j | -j | --japanese) printf '%s' "Japanese" ;;
+    e | -e | --english) printf '%s' "English" ;;
+    g | -g | --german) printf '%s' "German" ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_language_argument() {
+  if [[ $# -eq 0 ]]; then
+    printf '%s' "$DEFAULT_LANGUAGE"
+    return 0
+  fi
+
+  if [[ $# -gt 1 ]]; then
+    log_error "too many arguments: expected at most one language option"
+    return "$EXIT_USAGE"
+  fi
+
+  local language
+  if ! language="$(resolve_language "$1")"; then
+    log_error "unknown option '$1' (expected j, e or g)"
+    return "$EXIT_USAGE"
+  fi
+
+  printf '%s' "$language"
+}
+
+is_server_running() {
+  ollama ps >/dev/null 2>&1
+}
+
+# Starts `ollama serve` detached, with stdout/stderr discarded, and waits
+# until the server answers.
+start_server() {
+  log_info "starting ollama serve ..."
+  ollama serve >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+
+  local waited=0
+  while ! is_server_running; do
+    sleep "$SERVER_POLL_INTERVAL_SECONDS"
+    waited=$((waited + 1))
+    local elapsed_seconds
+    elapsed_seconds=$(awk "BEGIN { print $waited * $SERVER_POLL_INTERVAL_SECONDS }")
+    if awk "BEGIN { exit !($elapsed_seconds >= $SERVER_START_TIMEOUT_SECONDS) }"; then
+      log_error "ollama server did not become ready within ${SERVER_START_TIMEOUT_SECONDS}s"
+      return "$EXIT_UNAVAILABLE"
+    fi
+  done
+
+  log_info "ollama server is ready"
+}
+
+ensure_server() {
+  if ! command -v ollama >/dev/null 2>&1; then
+    log_error "'ollama' not found in PATH"
+    return "$EXIT_UNAVAILABLE"
+  fi
+
+  is_server_running && return 0
+  start_server
+}
+
+notify_if_model_missing() {
+  # Captured first: `grep -q` closes the pipe early, which would make the
+  # producer fail under `pipefail` even when the model is installed.
+  local installed_models
+  installed_models="$(ollama list 2>/dev/null)"
+
+  if ! grep -qF -- "$MODEL" <<<"$installed_models"; then
+    log_info "model '$MODEL' is not present locally; it will be pulled on first use"
+  fi
+}
+
+build_prompt() {
+  local language="$1" text="$2"
+  printf 'please translate this text in %s, and please print out only the result:\n%s' \
+    "$language" "$text"
+}
+
+translate() {
+  local language="$1" text="$2"
+  local prompt
+  prompt="$(build_prompt "$language" "$text")"
+  ollama run "$MODEL" "$prompt"
+}
+
+# Reads one line into REPLY_LINE. Uses readline editing on a terminal only,
+# so piped input keeps working. Returns non-zero on EOF (Ctrl-D).
+read_line() {
+  local prompt_label="$1"
+  if [[ -t 0 ]]; then
+    IFS= read -r -e -p "$prompt_label" REPLY_LINE
+  else
+    printf '%s' "$prompt_label"
+    IFS= read -r REPLY_LINE
+  fi
+}
+
+is_blank() {
+  [[ -z "${1//[[:space:]]/}" ]]
+}
+
+run_repl() {
+  local language="$1"
+  local prompt_label="[$language] > "
+  local REPLY_LINE=""
+
+  while read_line "$prompt_label"; do
+    is_blank "$REPLY_LINE" && continue
+    if ! translate "$language" "$REPLY_LINE"; then
+      log_error "translation failed"
+    fi
+    printf '\n'
+  done
+
+  printf '\n'
+}
+
+main() {
+  case "${1-}" in
+    -h | --help)
+      usage
+      return 0
+      ;;
+  esac
+
+  trap 'printf "\n"; exit '"$EXIT_INTERRUPTED" INT
+
+  local language status
+  language="$(parse_language_argument "$@")" || {
+    status=$?
+    usage >&2
+    return "$status"
+  }
+
+  ensure_server || return $?
+  notify_if_model_missing
+
+  log_info "model: $MODEL - quit with Ctrl-D or Ctrl-C"
+  run_repl "$language"
+}
+
+main "$@"
