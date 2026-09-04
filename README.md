@@ -54,7 +54,7 @@ gbdl: model: gemma3:12b - quit with Ctrl-D or Ctrl-C
 Clone the repository and symlink the script into a directory on your `PATH`:
 
 ```sh
-git clone https://github.com/<yoshito-maeoka>/gbdl.git
+git clone https://github.com/yoshito-maeoka/gbdl.git
 cd gbdl
 ln -s "$PWD/gbdl" /usr/local/bin/gbdl     # or ~/.local/bin, /opt/homebrew/bin, ...
 ```
