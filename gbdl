@@ -20,6 +20,25 @@ readonly EXIT_USAGE=2
 readonly EXIT_UNAVAILABLE=69
 readonly EXIT_INTERRUPTED=130
 
+# How long to keep collecting lines after the first one before deciding the
+# input is finished. A paste arrives in one burst and is collected whole; a
+# human typing pauses far longer than this. Bash 3.2 has neither fractional
+# `read` timeouts nor `read -t 0`, so it falls back to whole seconds and skips
+# the unterminated-tail handling below.
+if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+  readonly PASTE_DRAIN_SECONDS=0.2
+  readonly CAN_PROBE_INPUT=1
+else
+  readonly PASTE_DRAIN_SECONDS=1
+  readonly CAN_PROBE_INPUT=0
+fi
+
+# The lines of the input block currently being translated, and whether the last
+# of them arrived without a newline, which leaves the cursor mid-line.
+BLOCK_LINES=()
+BLOCK_UNTERMINATED=0
+SAVED_STTY=""
+
 usage() {
   cat <<'USAGE'
 Usage: gbdl [j|e|g]
@@ -134,36 +153,196 @@ translate() {
   local language="$1" text="$2"
   local prompt
   prompt="$(build_prompt "$language" "$text")"
-  ollama run "$MODEL" "$prompt"
+  # stdin is closed for the child: `ollama run` reads it and would otherwise
+  # consume the lines still queued behind the current one (a pasted block).
+  ollama run "$MODEL" "$prompt" </dev/null
 }
 
-# Reads one line into REPLY_LINE. Uses readline editing on a terminal only,
-# so piped input keeps working. Returns non-zero on EOF (Ctrl-D).
-read_line() {
-  local prompt_label="$1"
-  if [[ -t 0 ]]; then
-    IFS= read -r -e -p "$prompt_label" REPLY_LINE
-  else
-    printf '%s' "$prompt_label"
-    IFS= read -r REPLY_LINE
-  fi
+# Readline buffers a bracketed paste in its own line buffer and throws away
+# everything after the first newline, so a pasted paragraph would reach the
+# translator as its first line only. With the mode off the terminal delivers a
+# paste as ordinary lines that `read` consumes one by one, and arrow keys and
+# history keep working.
+#
+# The mode is turned off by a generated inputrc that still includes the user's
+# own. Readline reads INPUTRC from the process environment when it initialises,
+# and a variable exported from inside a running script never reaches it, so the
+# setting can only be applied by re-execing once with the variable already set.
+setup_readline() {
+  [[ -t 0 ]] || return 0
+  [[ -z "${GBDL_INPUTRC:-}" ]] || return 0
+
+  local generated="${TMPDIR:-/tmp}/gbdl-inputrc.$$"
+  local user_inputrc="${INPUTRC:-$HOME/.inputrc}"
+  {
+    [[ -r "$user_inputrc" ]] && printf '$include %s\n' "$user_inputrc"
+    printf 'set enable-bracketed-paste off\n'
+  } >"$generated" 2>/dev/null || return 0
+
+  exec env INPUTRC="$generated" GBDL_INPUTRC="$generated" "$0" "$@"
+}
+
+# Canonical mode releases a line only once its terminating newline arrives, so
+# the tail of a paste that ends without one would stay stuck in the terminal's
+# buffer, unreachable by `read`. Non-canonical mode releases the bytes as they
+# are; `read` then saves what it got into the variable when it times out
+# part-way through a line.
+begin_raw_input() {
+  SAVED_STTY="$(stty -g 2>/dev/null)" || { SAVED_STTY=""; return 1; }
+  stty -icanon min 1 time 0 2>/dev/null || { SAVED_STTY=""; return 1; }
+}
+
+end_raw_input() {
+  [[ -n "$SAVED_STTY" ]] || return 0
+  stty "$SAVED_STTY" 2>/dev/null
+  SAVED_STTY=""
+}
+
+# True when bytes are already waiting to be read.
+input_pending() {
+  read -r -t 0 2>/dev/null
+}
+
+cleanup() {
+  end_raw_input
+  [[ -n "${GBDL_INPUTRC:-}" ]] && rm -f "$GBDL_INPUTRC"
+  return 0
 }
 
 is_blank() {
   [[ -z "${1//[[:space:]]/}" ]]
 }
 
+# Appends the rest of a paste to BLOCK_LINES.
+#
+# Nothing is read unless bytes are already waiting at the moment the first line
+# was accepted: a paste is sitting in the buffer in its entirety by then, while
+# someone typing by hand has not managed a keystroke yet. That check is what
+# keeps the next thing the user types from being swallowed into this block.
+drain_pending_input() {
+  local pending="" line raw=0
+
+  if [[ "$CAN_PROBE_INPUT" -eq 1 ]] && begin_raw_input; then
+    if input_pending; then
+      raw=1
+    else
+      end_raw_input
+      return 0
+    fi
+  fi
+
+  while :; do
+    line=""
+    if IFS= read -r -t "$PASTE_DRAIN_SECONDS" line; then
+      BLOCK_LINES+=("$pending$line")
+      pending=""
+      continue
+    fi
+    # Timed out. A non-empty variable holds an unterminated line: the rest of
+    # it may still be on its way, so hold on to it and look again. Only a
+    # window in which nothing at all arrived ends the paste.
+    if [[ -n "$line" ]]; then
+      pending+="$line"
+      continue
+    fi
+    break
+  done
+
+  [[ "$raw" -eq 1 ]] && end_raw_input
+  if [[ -n "$pending" ]]; then
+    BLOCK_LINES+=("$pending")
+    BLOCK_UNTERMINATED=1
+  fi
+  return 0
+}
+
+# Collects one block of input into BLOCK_LINES. On a terminal the first line
+# blocks, then the rest of a paste is drained in one go: translating between
+# lines would stall for seconds while the remaining pasted text overflows the
+# terminal's small input buffer and is silently dropped. Piped input is read
+# to EOF. Returns non-zero once there is no more input (Ctrl-D).
+read_block() {
+  local prompt_label="$1"
+  local line=""
+  BLOCK_LINES=()
+  BLOCK_UNTERMINATED=0
+
+  if [[ -t 0 ]]; then
+    IFS= read -r -e -p "$prompt_label" line || [[ -n "$line" ]] || return 1
+    BLOCK_LINES+=("$line")
+    drain_pending_input
+  else
+    printf '%s' "$prompt_label"
+    while :; do
+      line=""
+      if ! IFS= read -r line; then
+        [[ -n "$line" ]] && BLOCK_LINES+=("$line")
+        break
+      fi
+      BLOCK_LINES+=("$line")
+    done
+    [[ ${#BLOCK_LINES[@]} -gt 0 ]] || return 1
+  fi
+}
+
+# Translates one paragraph as a single unit. A hard-wrapped paragraph must not
+# be sent line by line: each line is a sentence fragment, and the model can
+# only translate what it is given.
+translate_paragraph() {
+  local language="$1"
+  shift
+  local text
+  text="$(printf '%s\n' "$@")"
+
+  if ! translate "$language" "$text"; then
+    log_error "translation failed"
+  fi
+}
+
+# Prints the block's translation with the shape of the original: runs of
+# non-blank lines are translated as one paragraph, blank lines stay blank.
+translate_block() {
+  local language="$1"
+  local -a paragraph=()
+  local line
+
+  for line in "${BLOCK_LINES[@]}"; do
+    if is_blank "$line"; then
+      if [[ ${#paragraph[@]} -gt 0 ]]; then
+        translate_paragraph "$language" "${paragraph[@]}"
+        paragraph=()
+      fi
+      printf '\n'
+    else
+      paragraph+=("$line")
+    fi
+  done
+
+  if [[ ${#paragraph[@]} -gt 0 ]]; then
+    translate_paragraph "$language" "${paragraph[@]}"
+  fi
+}
+
+block_has_text() {
+  local line
+  for line in "${BLOCK_LINES[@]}"; do
+    is_blank "$line" || return 0
+  done
+  return 1
+}
+
 run_repl() {
   local language="$1"
   local prompt_label="[$language] > "
-  local REPLY_LINE=""
 
-  while read_line "$prompt_label"; do
-    is_blank "$REPLY_LINE" && continue
-    if ! translate "$language" "$REPLY_LINE"; then
-      log_error "translation failed"
-    fi
-    printf '\n'
+  while read_block "$prompt_label"; do
+    # A paste that ended without a newline leaves the cursor after the echoed
+    # text, so start the translation on a line of its own.
+    [[ "$BLOCK_UNTERMINATED" -eq 1 ]] && printf '\n'
+    translate_block "$language"
+    # Separates the result from the next prompt; a block that was nothing but
+    # blank lines has already printed them.
+    block_has_text && printf '\n'
   done
 
   printf '\n'
@@ -178,6 +357,7 @@ main() {
   esac
 
   trap 'printf "\n"; exit '"$EXIT_INTERRUPTED" INT
+  trap cleanup EXIT
 
   local language status
   language="$(parse_language_argument "$@")" || {
@@ -185,6 +365,9 @@ main() {
     usage >&2
     return "$status"
   }
+
+  # Before any real work: this re-execs the script on its first run.
+  setup_readline "$@"
 
   ensure_server || return $?
   notify_if_model_missing
